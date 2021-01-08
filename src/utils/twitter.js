@@ -1,6 +1,6 @@
 require('dotenv').config()
 const { TwitterClient } = require('twitter-api-client')
-
+const consola = require('consola')
 const twitterClient = new TwitterClient({
     apiKey: process.env.TWITTER_API_KEY,
     apiSecret: process.env.TWITTER_API_SECRET,
@@ -49,7 +49,7 @@ const convertMediaToTelegram = (ctx) => {
 
 const revertLinks = (formatted, originalLinks) => {
     originalLinks.forEach(e => {
-        formatted = formatted.replace(e.url, e.expended_url)
+        formatted = formatted.replace(e.url, e.expanded_url)
     })
 
     // Remove all extra link
@@ -78,17 +78,13 @@ const formatText = (str, tweet) => {
     return formatted
 }
 
-/**
-    So, we need to identify several stuff:
-        1. we need to revert all links
-        2. if it is images/movie, upload as albums
-        3. if it is link, keep it
-        4. add captions/link to origin tweet
-        5. Cannot handle movie for now, they use ts stream
-*/
-const getAllLikesSince = async (since_id) => {
-    const content = await twitterClient.tweets.favoritesList({ since_id, count: 200 })
-    content.pop()
+const getAllLikesSince = async () => {
+    const content = await twitterClient.tweets.favoritesList({ 
+        // Limit to 100, It is concerned that Twitter has some bug with the 
+        // number of tweets here. see #2
+        count: 100,
+        tweet_mode: 'extended'
+    })
     return content.map(e => {
         return {
             id: e.id_str,
@@ -98,18 +94,12 @@ const getAllLikesSince = async (since_id) => {
                 username: e.user.screen_name,
                 link: constructProfileLink(e.user.screen_name)
             },
-            text: formatText(e.text, e),
+            text: formatText(e.full_text, e),
             nsfw: e.possibly_sensitive
         }
     })
 }
 
-const getLatestLikeId = async() => {
-    const tweet = await twitterClient.tweets.favoritesList({count: 1})
-    return tweet[0].id_str
-}
-
 module.exports = {
-    getAllLikesSince,
-    getLatestLikeId
+    getAllLikesSince
 }

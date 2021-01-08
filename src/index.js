@@ -1,29 +1,29 @@
 require('dotenv').config()
-const Telegram = require('telegraf/telegram')
-const bot = new Telegram(process.env.TELEGRAM_CHANNELBOT)
-const readPath = process.argv[2] || `${__dirname}/../dist/data.json`
 const consola = require('consola')
 
-consola.info('data reading from: ', readPath)
-
 const channelID = process.env.TELEGRAM_CHATID
+const Telegram = require('telegraf/telegram')
+const bot = new Telegram(process.env.TELEGRAM_CHANNELBOT)
+
 const { getAllLikesSince, getLatestLikeId } = require('./utils/twitter')
 const { writeData, readData } = require('./utils/io') 
 const { RateLimit } = require('async-sema');
-const lim = RateLimit(7, { timeUnit: '60000' })
+const lim = RateLimit(5, { timeUnit: '60000', uniformDistribution: true})
+const retry = require('async-retry')
+const retryTimes = 5
 
 // Telegram allow 30 message/s, channel however, said 20 message / minute
 // This slow down the process, as each tweet can have upto 4 message so each time it is safe to process
 // ~5 tweet/minutes
-const main = async (last_acquired) => {
-    const likes = await getAllLikesSince(last_acquired)
+const main = async (likes) => {
     const messages = []
     // We cannot do map: we need rate limits
     for (const tweet of likes) {
         consola.info('tweet for: ', tweet)
-        const template = `${tweet.text}
+        const template = `<a href="${tweet.link}">Tweet</a> by <a href="${tweet.user.link}">@${tweet.user.username}</a> ${tweet.nsfw ? '#possiblyNSFW' : ''}
 
-<a href="${tweet.link}">Tweet</a> by <a href="${tweet.user.link}">@${tweet.user.username}</a> ${tweet.nsfw ? '#possiblyNSFW' : ''}`
+${tweet.text}
+`
         if (tweet.media.length !== 0) {
             // we need to double check if type are matched: video only or image only
             let mediaGroup = tweet.media
@@ -39,41 +39,82 @@ const main = async (last_acquired) => {
             consola.info('build message: ', mediaGroup)
 
             await lim()
-            messages.push(bot.sendMediaGroup(channelID, mediaGroup))
+            await retry(async (err, num) => {
+                if (num > 1) {
+                    // This should be at least the second attmept
+                    // We need to use a different URL to invalid the Telegram Cache
+                    mediaGroup = mediaGroup.map(e => {
+                        return {
+                            ...e,
+                            media: `${e.media}&${num}`
+                        }
+                    })
+                }
+                return bot.sendMediaGroup(channelID, mediaGroup)
+            }, {
+                retries: retryTimes
+            }).catch(e => consola.error(`${tweet.id} send failed after 5 retries`))
             continue
         }
 
         await lim()
-        messages.push(bot.sendMessage(channelID, template, {
+        await retry(async () => bot.sendMessage(channelID, template, {
             parse_mode: 'html'
-        }))
+        }), {
+            retries: retryTimes
+        }).catch(e => consola.error(`${tweet.id} send failed after 5 retries`))
     }
 
-    return Promise.all(messages)
+    return messages
 }
 
-const reset = async () => {
-    const res = await getLatestLikeId().catch(e => {
-        consola.error(e)
-    })
-    const d =  { last_acquired: res }
-    consola.info('write first time data: ', d)
-    writeData(readPath, d)
-    consola.success('finished processed')
+const update = async (prev_ids, likes) => {
+    const shouldUpdate = []
+
+    for (const like of likes) {
+        if (!prev_ids.includes(like.id)) {
+            shouldUpdate.push(like)
+        }
+    }
+
+    if (shouldUpdate.length !== 0) {
+        // We will store all like id
+        // Gist allow up to 1M, so we should be safe... for now?
+        const d =  { since_id: [ ...prev_ids, ...shouldUpdate.map(e => e.id) ] }
+        await writeData(d)
+        consola.success('Gist updated!')
+    }
+
+    consola.success(`Finished update: prev(${prev_ids.length}), current(${likes.length}), diff(${shouldUpdate.length})`)
+
+    return shouldUpdate
 }
 
-const rec = readData(readPath)
+readData().then(res => {
+    consola.info('data read: ', res)
+    if (res && res.since_id) {
+        const prev_ids = res.since_id
+        getAllLikesSince().then(likes => {
+            // we issue the update first, to avoid duplicate actions from dispatch and overlap
+            update(prev_ids, likes).then(updates => {  
+                main(updates).then(() => {
+                    consola.success('finished processed')
+                }).catch(e => {
+                    consola.error(e)
+                })
+            })
+        }).catch(e => {
+            consola.error(e)
+        })
+    } else {
+        consola.info('first time access detected')
+        getAllLikesSince().then(likes => {
+            update([], likes)
+        }).catch(e => {
+            consola.error(e)
+        })
+    }
+}).catch(e => {
+    consola.error(e)
+})
 
-consola.info('data read: ', rec)
-
-if (rec) {
-    main(rec).then(() => {
-        consola.success('finished processed')
-    }).catch(e => {
-        consola.error(e)
-    }).finally(() => {
-        reset()
-    })
-} else {
-    reset()
-}
